@@ -10,6 +10,7 @@ from ai_client    import chat, stream_chat, parse_json_from_response
 from prompts      import EXTRACT_SYSTEM, DFD_SYSTEM, RISK_SYSTEM
 from dfd_renderer import render_dfd
 from drawio_export  import generate_drawio_xml
+from visio_export   import generate_vsdx
 
 st.set_page_config(page_title="ROPA — DFD Analyzer", page_icon="🔐",
                    layout="wide", initial_sidebar_state="expanded")
@@ -316,6 +317,11 @@ if "dfds" in st.session_state or "risk_md" in st.session_state:
                 pn   = dfd.get("process_name",f"P{i+1:03d}")
                 safe = pn.replace(" ","_").replace("/","-")[:30]
                 pid  = dfd.get("id",f"P{i+1:03d}")
+                try:
+                    va,vf = generate_vsdx(dfd)
+                    zf.writestr(f"visio/DFD_{pid}_{safe}_CurrentState.vsdx", va)
+                    zf.writestr(f"visio/DFD_{pid}_{safe}_PostCompliance.vsdx", vf)
+                except Exception: pass
                 if dfd.get("_asis_png"):   zf.writestr(f"dfds/DFD_{pid}_{safe}_CurrentState.png",   dfd["_asis_png"])
                 if dfd.get("_asis_pdf"):   zf.writestr(f"dfds/DFD_{pid}_{safe}_CurrentState.pdf",   dfd["_asis_pdf"])
                 if dfd.get("_future_png"): zf.writestr(f"dfds/DFD_{pid}_{safe}_PostCompliance.png", dfd["_future_png"])
@@ -350,6 +356,35 @@ if "dfds" in st.session_state or "risk_md" in st.session_state:
                 dci+=1
             except Exception as ex:
                 st.warning(f"draw.io export failed for {pid}: {ex}")
+
+        # ── Visio .vsdx export ─────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🔷 Microsoft Visio Files (.vsdx)")
+        st.markdown('<div class="info-box">Download as <b>.vsdx</b> → open directly in <b>Microsoft Visio</b> (2013+ or Microsoft 365). All shapes, connectors and privacy controls are fully editable. Resize, restyle, add annotations, change layout.</div>', unsafe_allow_html=True)
+        visio_cols = st.columns(min(len(dfds)*2, 6))
+        vci = 0
+        for i, dfd in enumerate(dfds):
+            pname = dfd.get("process_name", f"P{i+1:03d}")
+            safe  = pname.replace(" ","_").replace("/","-")[:30]
+            pid   = dfd.get("id", f"P{i+1:03d}")
+            try:
+                v_asis, v_future = generate_vsdx(dfd)
+                with visio_cols[vci % 6]:
+                    st.download_button(f"🔷 {pid} Visio As-Is",
+                        data=v_asis,
+                        file_name=f"DFD_{pid}_{safe}_CurrentState.vsdx",
+                        mime="application/vnd.ms-visio.drawing",
+                        use_container_width=True, key=f"vsdx_a_{i}")
+                vci+=1
+                with visio_cols[vci % 6]:
+                    st.download_button(f"🔷 {pid} Visio Post-Compliance",
+                        data=v_future,
+                        file_name=f"DFD_{pid}_{safe}_PostCompliance.vsdx",
+                        mime="application/vnd.ms-visio.drawing",
+                        use_container_width=True, key=f"vsdx_f_{i}")
+                vci+=1
+            except Exception as ex:
+                st.warning(f"Visio export failed for {pid}: {ex}")
 
         st.markdown("---")
         st.download_button("📦 Full Bundle (ZIP)", data=zio.getvalue(), file_name=f"ropa_analysis_{ts}.zip", mime="application/zip")
