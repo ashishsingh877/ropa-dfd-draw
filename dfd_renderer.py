@@ -1,9 +1,10 @@
 """
-dfd_renderer.py — Professional DFD Renderer v15
-Pure PIL drawing — no Graphviz layout engine.
-Full pixel control. Clean landscape. Matches RateGain reference.
+dfd_renderer.py — Professional DFD Renderer FINAL
+Based on the working layout: sources rank=same | main chain | storage rank=same | recipients rank=same | exit rank=same
+Privacy controls overlaid with PIL at exact node positions from Graphviz JSON.
+250 DPI, print-quality, matches RateGain reference style.
 """
-import io, re, math, textwrap
+import io, re, json, math, textwrap, graphviz
 from PIL import Image, ImageDraw, ImageFont
 
 _FONT_REG  = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -13,383 +14,296 @@ def _f(sz, bold=False):
     try:    return ImageFont.truetype(_FONT_BOLD if bold else _FONT_REG, sz)
     except: return ImageFont.load_default()
 
+def _gv(text, n=15):
+    lines = textwrap.wrap(str(text).strip(), width=n)
+    return "\\n".join(lines[:3]) if lines else str(text)
+
 def _sid(s):
     return re.sub(r"[^a-zA-Z0-9_]","_",str(s).strip())[:35]
 
-def _wrap(text, max_chars=16):
-    return "\n".join(textwrap.wrap(str(text).strip(), width=max_chars)[:3])
+# ── Node styles ────────────────────────────────────────────────────────────────
+PHASE_RANK = {"collection":0,"processing":1,"storage":2,"sharing":3,"exit":4,"main":2}
 
-# ── Colours ────────────────────────────────────────────────────────────────────
-C = {
-    "external_fill":  "#FFF5CC", "external_stroke": "#A07800", "external_text": "#5C4400",
-    "team_fill":      "#FADADD", "team_stroke":     "#B03030", "team_text":     "#641E16",
-    "process_fill":   "#FFFFFF", "process_stroke":  "#555555", "process_text":  "#1A1A1A",
-    "decision_fill":  "#C0392B", "decision_stroke": "#8B2222", "decision_text": "#FFFFFF",
-    "endpoint_fill":  "#B03030", "endpoint_stroke": "#7B1A1A", "endpoint_text": "#FFFFFF",
-    "datastore_fill": "#D4E8FA", "datastore_stroke":"#1A5276", "datastore_text":"#0D3B6E",
-    "ctrl_fill":      "#D5E8D4", "ctrl_stroke":     "#27AE60", "ctrl_text":     "#145A32",
-    "edge_normal":    "#666666",
-    "edge_sensitive": "#C0392B",
-    "edge_back":      "#AAAAAA",
-    "header_bg":      "#1A3A5C",
-    "banner_asis":    "#C0392B",
-    "banner_future":  "#1A6B3A",
-    "bg":             "#FFFFFF",
-    "legend_bg":      "#F4F6F8",
-}
+def _node_gv(ntype, label):
+    label = _gv(label, 14)
+    base  = dict(fontname="Helvetica", fontsize="12",
+                 margin="0.22,0.14", penwidth="1.6")
+    styles = {
+        "external":  dict(shape="box",     style="filled,rounded",
+                          fillcolor="#FFF5CC",color="#A07800",fontcolor="#5C4400",
+                          width="1.7",height="0.6"),
+        "team":      dict(shape="box",     style="filled",
+                          fillcolor="#FADADD",color="#B03030",fontcolor="#641E16",
+                          fontname="Helvetica-Bold",width="1.7",height="0.6",penwidth="2.0"),
+        "process":   dict(shape="box",     style="filled",
+                          fillcolor="#FFFFFF",color="#555555",fontcolor="#1A1A1A",
+                          width="1.7",height="0.6"),
+        "decision":  dict(shape="diamond", style="filled",
+                          fillcolor="#C0392B",color="#8B2222",fontcolor="#FFFFFF",
+                          fontname="Helvetica-Bold",fontsize="11",
+                          width="1.7",height="0.75",penwidth="2.0"),
+        "endpoint":  dict(shape="ellipse", style="filled",
+                          fillcolor="#B03030",color="#7B1A1A",fontcolor="#FFFFFF",
+                          fontname="Helvetica-Bold",width="1.6",height="0.6",penwidth="2.0"),
+        "datastore": dict(shape="cylinder",style="filled",
+                          fillcolor="#D4E8FA",color="#1A5276",fontcolor="#0D3B6E",
+                          width="1.7",height="0.7"),
+    }
+    s = styles.get(ntype, styles["process"]).copy()
+    s.update(base)
+    return label, s
 
-# ── Canvas constants ───────────────────────────────────────────────────────────
-W_CANVAS  = 5400    # landscape width
-HEADER_H  = 90
-BANNER_H  = 50
-LEG_H     = 50
-CHART_PAD = 60      # padding inside chart area
+GV_DPI = 180
 
-# Node sizes
-NODE_W    = 170
-NODE_H    = 60
-DECISION_W= 170     # diamond width
-DECISION_H= 90
-ENDPOINT_W= 150
-ENDPOINT_H= 60
-DS_W      = 160
-DS_H      = 70
-
-CTRL_W    = 165
-CTRL_H    = 30
-CTRL_GAP  = 8
-
-ARROW_COLOR  = "#666666"
-ARROW_HEAD   = 12
-
-
-# ── Low-level drawing primitives ───────────────────────────────────────────────
-
-def _text_in_box(draw, x, y, w, h, text, font, color):
-    lines = _wrap(text, int(w/7)).split("\n")
-    total_h = len(lines) * (font.size + 2)
-    ty = y + (h - total_h) // 2
-    for line in lines:
-        try:
-            bb = draw.textbbox((0,0), line, font=font)
-            tw = bb[2]-bb[0]
-        except:
-            tw = len(line)*7
-        draw.text((x + (w-tw)//2, ty), line, font=font, fill=color)
-        ty += font.size + 3
-
-def _draw_box(draw, x, y, w, h, fill, stroke, text, bold=False, font_size=13, stroke_w=2):
-    draw.rounded_rectangle([x,y,x+w,y+h], radius=6, fill=fill, outline=stroke, width=stroke_w)
-    font = _f(font_size, bold)
-    _text_in_box(draw, x, y, w, h, text, font, C["process_text"] if fill=="#FFFFFF" else
-                 (C["team_text"] if "FAD" in fill else (C["external_text"] if "FFF5" in fill else C["endpoint_text"])))
-
-def _draw_external(draw, x, y, w, h, text):
-    draw.rounded_rectangle([x,y,x+w,y+h], radius=10, fill=C["external_fill"], outline=C["external_stroke"], width=2)
-    _text_in_box(draw, x, y, w, h, text, _f(12), C["external_text"])
-
-def _draw_team(draw, x, y, w, h, text):
-    draw.rectangle([x,y,x+w,y+h], fill=C["team_fill"], outline=C["team_stroke"], width=2)
-    _text_in_box(draw, x, y, w, h, text, _f(13, bold=True), C["team_text"])
-
-def _draw_process(draw, x, y, w, h, text):
-    draw.rectangle([x,y,x+w,y+h], fill=C["process_fill"], outline=C["process_stroke"], width=1)
-    _text_in_box(draw, x, y, w, h, text, _f(12), C["process_text"])
-
-def _draw_decision(draw, x, y, w, h, text):
-    # Diamond
-    cx, cy = x+w//2, y+h//2
-    pts = [(cx,y),(x+w,cy),(cx,y+h),(x,cy)]
-    draw.polygon(pts, fill=C["decision_fill"], outline=C["decision_stroke"])
-    draw.line([pts[0],pts[1]], fill=C["decision_stroke"], width=2)
-    draw.line([pts[1],pts[2]], fill=C["decision_stroke"], width=2)
-    draw.line([pts[2],pts[3]], fill=C["decision_stroke"], width=2)
-    draw.line([pts[3],pts[0]], fill=C["decision_stroke"], width=2)
-    _text_in_box(draw, x+10, y+10, w-20, h-20, text, _f(12, bold=True), C["decision_text"])
-
-def _draw_endpoint(draw, x, y, w, h, text):
-    draw.ellipse([x,y,x+w,y+h], fill=C["endpoint_fill"], outline=C["endpoint_stroke"], width=2)
-    _text_in_box(draw, x, y, w, h, text, _f(12, bold=True), C["endpoint_text"])
-
-def _draw_datastore(draw, x, y, w, h, text):
-    # Cylinder (rectangle with ellipse caps)
-    cap = 16
-    draw.rectangle([x, y+cap//2, x+w, y+h-cap//2], fill=C["datastore_fill"], outline=C["datastore_fill"])
-    draw.ellipse([x, y, x+w, y+cap], fill=C["datastore_fill"], outline=C["datastore_stroke"], width=1)
-    draw.ellipse([x, y+h-cap, x+w, y+h], fill=C["datastore_fill"], outline=C["datastore_stroke"], width=1)
-    draw.line([x, y+cap//2, x, y+h-cap//2], fill=C["datastore_stroke"], width=1)
-    draw.line([x+w, y+cap//2, x+w, y+h-cap//2], fill=C["datastore_stroke"], width=1)
-    _text_in_box(draw, x, y+cap//2, w, h-cap, text, _f(12), C["datastore_text"])
-
-def _draw_ctrl_box(draw, x, y, text):
-    draw.rounded_rectangle([x,y,x+CTRL_W,y+CTRL_H], radius=7,
-                            fill=C["ctrl_fill"], outline=C["ctrl_stroke"], width=1)
-    f = _f(9)
-    try:
-        bb = draw.textbbox((0,0), text[:26], font=f)
-        tw,th = bb[2]-bb[0], bb[3]-bb[1]
-    except:
-        tw,th = len(text)*6, 9
-    draw.text((x+(CTRL_W-tw)//2, y+(CTRL_H-th)//2), text[:26], font=f, fill=C["ctrl_text"])
-
-def _arrow(draw, x1,y1, x2,y2, color="#666666", width=2, dashed=False, label=""):
-    """Draw an arrow from (x1,y1) to (x2,y2) with optional label."""
-    if dashed:
-        # Draw dashed line
-        dx,dy = x2-x1, y2-y1
-        dist = max(1, math.sqrt(dx*dx+dy*dy))
-        dash=12; gap=6; step=dash+gap
-        n_steps = int(dist/step)
-        for i in range(n_steps+1):
-            t0 = i*step/dist; t1 = min((i*step+dash)/dist, 1.0)
-            draw.line([(int(x1+dx*t0),int(y1+dy*t0)),(int(x1+dx*t1),int(y1+dy*t1))],
-                      fill=color, width=width)
-    else:
-        draw.line([(x1,y1),(x2,y2)], fill=color, width=width)
-    # Arrowhead
-    dx,dy = x2-x1, y2-y1
-    dist  = max(1, math.sqrt(dx*dx+dy*dy))
-    dx,dy = dx/dist, dy/dist
-    ax1 = int(x2 - ARROW_HEAD*dx - ARROW_HEAD*0.5*(-dy))
-    ay1 = int(y2 - ARROW_HEAD*dy - ARROW_HEAD*0.5*dx)
-    ax2 = int(x2 - ARROW_HEAD*dx + ARROW_HEAD*0.5*(-dy))
-    ay2 = int(y2 - ARROW_HEAD*dy + ARROW_HEAD*0.5*dx)
-    draw.polygon([(x2,y2),(ax1,ay1),(ax2,ay2)], fill=color)
-    # Label
-    if label:
-        mx, my = (x1+x2)//2, (y1+y2)//2
-        f = _f(9)
-        try:
-            bb = draw.textbbox((0,0),label,font=f); tw=bb[2]-bb[0]
-        except: tw=len(label)*6
-        # White bg behind label
-        draw.rectangle([mx-tw//2-3, my-8, mx+tw//2+3, my+8], fill="#FFFFFF")
-        draw.text((mx-tw//2, my-6), label, font=f, fill="#555555")
-
-def _node_center(pos):
-    ntype,x,y,w,h = pos
-    return x+w//2, y+h//2
-
-def _node_edge(pos, side):
-    """Get connection point on edge: side = 'left','right','top','bottom'"""
-    ntype,x,y,w,h = pos[0],pos[1],pos[2],pos[3],pos[4]
-    cx,cy = x+w//2, y+h//2
-    if side=="right":  return x+w, cy
-    if side=="left":   return x, cy
-    if side=="top":    return cx, y
-    if side=="bottom": return cx, y+h
-    return cx,cy
-
-
-# ── Main render function ───────────────────────────────────────────────────────
-
-def _draw_node(draw, pos):
-    ntype,x,y,w,h = pos[:5]
-    label = pos[5] if len(pos)>5 else ""
-    if ntype=="external":  _draw_external(draw,x,y,w,h,label)
-    elif ntype=="team":    _draw_team(draw,x,y,w,h,label)
-    elif ntype=="process": _draw_process(draw,x,y,w,h,label)
-    elif ntype=="decision":_draw_decision(draw,x,y,w,h,label)
-    elif ntype=="endpoint":_draw_endpoint(draw,x,y,w,h,label)
-    elif ntype=="datastore":_draw_datastore(draw,x,y,w,h,label)
-
-
-def _compute_layout(nodes, canvas_w, canvas_h):
-    """
-    Compute pixel positions for all nodes in a landscape left-to-right layout.
-    Phases: collection(left) | processing | storage | sharing | exit(right)
-    """
-    PHASE_ORDER = ["collection","processing","storage","sharing","exit","main"]
-    PHASE_X = {}
-    usable_w = canvas_w - CHART_PAD*2
-
-    # Assign X zones
-    zone_w = usable_w // 5
-    for i,ph in enumerate(["collection","processing","storage","sharing","exit"]):
-        PHASE_X[ph] = CHART_PAD + i*zone_w
-    PHASE_X["main"] = PHASE_X["processing"]
+def _build_dot(data: dict) -> graphviz.Digraph:
+    nodes = data.get("nodes",[])
+    edges = data.get("edges",[])
 
     # Group by phase
-    phase_map = {}
+    phase_map: dict = {}
     for n in nodes:
         ph = n.get("phase","processing").lower()
-        if ph not in PHASE_X: ph="processing"
+        if ph not in PHASE_RANK: ph="processing"
         phase_map.setdefault(ph,[]).append(n)
 
-    NODE_SIZES = {
-        "external":  (NODE_W,   NODE_H),
-        "team":      (NODE_W+10,NODE_H+10),
-        "process":   (NODE_W,   NODE_H),
-        "decision":  (DECISION_W,DECISION_H),
-        "endpoint":  (ENDPOINT_W,ENDPOINT_H),
-        "datastore": (DS_W,     DS_H),
-    }
-
-    layout = {}   # node_id → (type, x, y, w, h, label)
-
-    for ph in PHASE_ORDER:
-        ph_nodes = phase_map.get(ph,[])
-        if not ph_nodes: continue
-        n_nodes = len(ph_nodes)
-        zone_x  = PHASE_X.get(ph, CHART_PAD)
-        # Distribute vertically
-        spacing = canvas_h // (n_nodes+1)
-        for i,n in enumerate(ph_nodes):
-            nid  = _sid(n["id"])
-            ntype= n.get("type","process")
-            lbl  = n.get("label","")
-            w,h  = NODE_SIZES.get(ntype,(NODE_W,NODE_H))
-            cy   = spacing*(i+1)
-            cx   = zone_x + zone_w//2
-            layout[nid] = (ntype, cx-w//2, cy-h//2, w, h, lbl)
-
-    return layout, zone_w
-
-
-def _render_diagram(nodes, edges, privacy_controls,
-                    show_controls, canvas_w, canvas_h):
-    """Render one diagram on a transparent canvas."""
-    img  = Image.new("RGB", (canvas_w, canvas_h), "#FFFFFF")
-    draw = ImageDraw.Draw(img)
-
-    layout, zone_w = _compute_layout(nodes, canvas_w, canvas_h)
-
-    # Fuzzy resolve controls
-    def _norm(s): return re.sub(r"[^a-z0-9]","_",str(s).lower().strip())
-    norm_map = {}
-    for nid in layout:
-        norm_map[_norm(nid)] = nid
-        parts=[p for p in _norm(nid).split("_") if len(p)>2]
-        if parts: norm_map[parts[0]] = nid
-
-    resolved_ctrls = {}
-    if show_controls:
-        for key,clist in privacy_controls.items():
-            sid = _sid(key)
-            if sid in layout: nid=sid
-            else:
-                nk=_norm(key)
-                nid=norm_map.get(nk) or norm_map.get(nk.split("_")[0] if "_" in nk else nk)
-            if nid: resolved_ctrls[nid]=clist[:4]
-
-    # Draw phase lane headers
-    PHASE_ORDER = ["collection","processing","storage","sharing","exit"]
-    PHASE_LABELS = ["① Collection","② Processing","③ Storage","④ Sharing","⑤ Exit / Archive"]
-    PHASE_COLORS = ["#EAF4FB","#FEF9F0","#F0FAF0","#FFF8F0","#FDF0F0"]
-    usable_w = canvas_w - CHART_PAD*2
-    zone_w2  = usable_w // 5
-    for i,(ph,lbl,bg) in enumerate(zip(PHASE_ORDER,PHASE_LABELS,PHASE_COLORS)):
-        lx = CHART_PAD + i*zone_w2
-        draw.rectangle([lx,0,lx+zone_w2,canvas_h], fill=bg)
-        draw.line([(lx,0),(lx,canvas_h)], fill="#DDDDDD", width=1)
-        f = _f(11, bold=True)
-        try:
-            bb=draw.textbbox((0,0),lbl,font=f); tw=bb[2]-bb[0]
-        except: tw=len(lbl)*8
-        draw.text((lx+(zone_w2-tw)//2, 10), lbl, font=f, fill="#1A3A5C")
-    draw.line([(CHART_PAD+5*zone_w2,0),(CHART_PAD+5*zone_w2,canvas_h)], fill="#DDDDDD", width=1)
-
-    # Draw edges
+    # Node rank lookup
     node_rank = {}
     for n in nodes:
         ph=n.get("phase","processing").lower()
-        pr={"collection":0,"processing":1,"storage":2,"sharing":3,"exit":4,"main":2}
-        node_rank[_sid(n["id"])] = pr.get(ph,2)
+        if ph not in PHASE_RANK: ph="processing"
+        node_rank[_sid(n["id"])] = PHASE_RANK[ph]
 
-    for e in edges:
-        src=_sid(e.get("from","")); dst=_sid(e.get("to",""))
-        if src not in layout or dst not in layout: continue
-        sp=layout[src]; dp=layout[dst]
-        lbl=e.get("label","")
-        raw=lbl.lower()
-        sensitive=any(k in raw for k in ["health","medical","biometric","salary","financial","bank","sensitive","aadhaar","pan"])
-        is_back = node_rank.get(src,2) >= node_rank.get(dst,2) and src!=dst
+    dot = graphviz.Digraph(engine="dot")
+    dot.attr("graph",
+        rankdir  = "LR",
+        splines  = "ortho",
+        nodesep  = "0.65",
+        ranksep  = "1.90",
+        pad      = "0.55",
+        bgcolor  = "white",
+        size     = "28,10!",
+        ratio    = "fill",
+        dpi      = str(GV_DPI),
+        fontname = "Helvetica",
+    )
+    dot.attr("edge",
+        fontname ="Helvetica", fontsize="8",
+        color    ="#888888",   fontcolor="#666666",
+        arrowsize="0.85",     penwidth ="1.3",
+    )
 
-        color  = C["edge_sensitive"] if sensitive else (C["edge_back"] if is_back else C["edge_normal"])
-        width_ = 3 if sensitive else (1 if is_back else 2)
-
-        # Connection points
-        sx,sy = _node_edge(sp,"right")
-        dx2,dy2 = _node_edge(dp,"left")
-        if is_back:
-            # Route back edge: go down, then back left
-            sx,sy  = _node_edge(sp,"bottom")
-            dx2,dy2= _node_edge(dp,"bottom")
-            mid_y  = max(sy,dy2) + 40
-            pts = [(sx,sy),(sx,mid_y),(dx2,mid_y),(dx2,dy2)]
-            for i in range(len(pts)-1):
-                _arrow(draw,pts[i][0],pts[i][1],pts[i+1][0],pts[i+1][1],
-                       color=color,width=width_,dashed=True)
-            # Label in middle
-            if lbl:
-                mx=(sx+dx2)//2; my=mid_y+6
-                f=_f(9)
-                try: bb=draw.textbbox((0,0),lbl,font=f); tw=bb[2]-bb[0]
-                except: tw=len(lbl)*6
-                draw.rectangle([mx-tw//2-3,my-2,mx+tw//2+3,my+12],fill="#FFFFFF")
-                draw.text((mx-tw//2,my),lbl,font=f,fill="#888888")
+    # Add all nodes; parallel phases use rank=same
+    for ph, ph_nodes in phase_map.items():
+        if ph in ("collection","sharing","exit") and len(ph_nodes) >= 1:
+            with dot.subgraph() as sg:
+                sg.attr(rank="same")
+                for n in ph_nodes:
+                    lbl, attrs = _node_gv(n.get("type","process"), n.get("label",""))
+                    sg.node(_sid(n["id"]), label=lbl, **attrs)
+        elif ph == "storage":
+            with dot.subgraph() as sg:
+                sg.attr(rank="same")
+                for n in ph_nodes:
+                    lbl, attrs = _node_gv(n.get("type","process"), n.get("label",""))
+                    sg.node(_sid(n["id"]), label=lbl, **attrs)
         else:
-            _arrow(draw,sx,sy,dx2,dy2,color=color,width=width_,
-                   dashed=False,label=lbl)
+            # processing / main — add individually, let dot rank them naturally
+            for n in ph_nodes:
+                lbl, attrs = _node_gv(n.get("type","process"), n.get("label",""))
+                dot.node(_sid(n["id"]), label=lbl, **attrs)
 
-    # Draw nodes (on top of edges)
-    for nid,pos in layout.items():
-        _draw_node(draw,pos)
+    # Edges
+    for e in edges:
+        s = _sid(e.get("from",""))
+        t = _sid(e.get("to",""))
+        if not s or not t: continue
+        raw = e.get("label","").strip()
+        lbl = (raw[:14]+"…") if len(raw)>15 else raw
+        sensitive = any(k in raw.lower() for k in
+            ["health","medical","biometric","salary","financial","bank","sensitive","aadhaar","pan"])
+        sr = node_rank.get(s,2); dr_ = node_rank.get(t,2)
+        is_back = sr >= dr_ and s != t
+        attrs = dict(
+            color    = "#C0392B" if sensitive else ("#AAAAAA" if is_back else "#888888"),
+            fontcolor= "#666666",
+            penwidth = "2.2"     if sensitive else ("1.0" if is_back else "1.3"),
+        )
+        if is_back:
+            attrs["constraint"] = "false"
+            attrs["style"]      = "dashed"
+        if lbl:
+            attrs["xlabel"]   = "  "+lbl+"  "
+            attrs["fontsize"] = "8"
+        dot.edge(s, t, **attrs)
 
-    # Draw privacy controls (below each node)
-    if show_controls:
-        for nid,ctrls in resolved_ctrls.items():
-            if nid not in layout: continue
-            ntype,nx,ny,nw,nh,_ = layout[nid]
-            # Controls start below node
-            start_y = ny + nh + 14
-            # Place controls in 2 columns
-            cols=2
-            for ci,ctrl in enumerate(ctrls[:4]):
-                col=ci%cols; row=ci//cols
-                cx_ = nx + col*(CTRL_W+6) - (CTRL_W*cols + 6*(cols-1) - nw)//2
-                cy_ = start_y + row*(CTRL_H+CTRL_GAP)
-                _draw_ctrl_box(draw, cx_, cy_, ctrl)
-            # Dashed connector from node bottom to first control
-            fx = nx+nw//2; fy = ny+nh
-            lx = nx+nw//2; ly = start_y-2
-            draw.line([(fx,fy),(lx,ly)], fill="#27AE60", width=1)
+    return dot
 
+
+def _get_node_positions(dot: graphviz.Digraph, img_w: int, img_h: int) -> dict:
+    """Get precise pixel positions of each node from Graphviz JSON output."""
+    try:
+        raw = dot.pipe(format="json")
+        gv  = json.loads(raw)
+    except Exception:
+        return {}
+    bb  = [float(x) for x in gv.get("bb","0,0,100,100").split(",")]
+    if bb[2]==0 or bb[3]==0: return {}
+    sx, sy = img_w/bb[2], img_h/bb[3]
+    pos = {}
+    for obj in gv.get("objects",[]):
+        name = obj.get("name","")
+        if not name: continue
+        ps = obj.get("pos","")
+        if not ps or "," not in ps: continue
+        try: gx,gy = [float(v) for v in ps.split(",")]
+        except: continue
+        wi = float(obj.get("width",1.0))
+        hi = float(obj.get("height",0.5))
+        cx = gx*sx;  cy = (bb[3]-gy)*sy
+        pw = wi*72*sx; ph = hi*72*sy
+        pos[name] = dict(cx=cx,cy=cy,w=pw,h=ph,
+                         x1=cx-pw/2,y1=cy-ph/2,
+                         x2=cx+pw/2,y2=cy+ph/2)
+    return pos
+
+
+def _overlay_privacy_controls(flow_img: Image.Image, positions: dict,
+                               privacy_controls: dict, nodes: list) -> Image.Image:
+    """Overlay green privacy control boxes directly on diagram near each node."""
+    img  = flow_img.copy()
+    draw = ImageDraw.Draw(img)
+    W, H = img.size
+    sc   = W / 4800
+
+    BW   = max(155, int(200*sc))
+    BH   = max(28,  int(34*sc))
+    GX   = max(7,   int(10*sc))
+    GY   = max(5,   int(7*sc))
+    MAR  = max(18,  int(24*sc))
+    FS   = max(9,   int(11*sc))
+    PR   = max(5,   int(7*sc))
+    LW   = max(1,   int(2*sc))
+    COLS = 2
+
+    # Fuzzy key resolution
+    def _norm(s): return re.sub(r"[^a-z0-9]","_",str(s).lower().strip())
+    nmap = {}
+    for pk in positions:
+        nmap[_norm(pk)] = pk
+        parts=[p for p in _norm(pk).split("_") if len(p)>2]
+        if parts: nmap[parts[0]] = pk
+
+    for raw_key, controls in privacy_controls.items():
+        if not controls: continue
+        sid = _sid(raw_key)
+        pk  = sid if sid in positions else nmap.get(_norm(raw_key)) or nmap.get(_norm(raw_key).split("_")[0])
+        if not pk: continue
+
+        p     = positions[pk]
+        pills = controls[:4]
+        nr    = math.ceil(len(pills)/COLS)
+        nc    = min(COLS,len(pills))
+        BLW   = nc*(BW+GX)-GX
+        BLH   = nr*(BH+GY)-GY
+
+        # Place above if space, else below
+        if p["y1"] > BLH + MAR + 4:
+            bx = p["cx"] - BLW/2
+            by = p["y1"] - BLH - MAR
+            # Connector
+            draw.line([(int(p["cx"]),int(p["y1"])),
+                       (int(p["cx"]),int(by+BLH+2))],
+                      fill="#27AE60", width=LW)
+        else:
+            bx = p["cx"] - BLW/2
+            by = p["y2"] + MAR
+            draw.line([(int(p["cx"]),int(p["y2"])),
+                       (int(p["cx"]),int(by-2))],
+                      fill="#27AE60", width=LW)
+
+        bx = max(2, min(float(bx), W-BLW-2))
+        by = max(2, min(float(by), H-BLH-2))
+
+        for i, ctrl in enumerate(pills):
+            r=i//COLS; c=i%COLS
+            px=bx+c*(BW+GX); py=by+r*(BH+GY)
+            draw.rounded_rectangle(
+                [int(px),int(py),int(px+BW),int(py+BH)],
+                radius=PR, fill="#D5E8D4", outline="#2E8B57", width=1)
+            text=ctrl[:24]; f=_f(FS)
+            try:
+                bb2=draw.textbbox((0,0),text,font=f)
+                tw,th=bb2[2]-bb2[0],bb2[3]-bb2[1]
+            except: tw,th=len(text)*6,FS
+            draw.text((int(px+(BW-tw)/2),int(py+(BH-th)/2)),text,font=f,fill="#145A32")
     return img
 
 
-def _make_page(diagram_img: Image.Image, title: str, state: str,
-               banner_txt: str, banner_color: str) -> Image.Image:
-    """Wrap diagram in professional header/banner/legend."""
-    DW, DH = diagram_img.size
-    W  = DW + 80
-    H  = HEADER_H + BANNER_H + DH + LEG_H + 20
+# ── PIL page composition ───────────────────────────────────────────────────────
+HEADER_H=88; BANNER_H=52; LEG_H=52; PAD=44
+TOP_PAD=280; BOT_PAD=60
 
+def _compose_page(flow_png: bytes, title: str, state: str,
+                  banner_txt: str, banner_color: str,
+                  privacy_controls: dict = None,
+                  nodes: list = None,
+                  dot_obj: graphviz.Digraph = None) -> Image.Image:
+
+    # Load flow image
+    g = Image.open(io.BytesIO(flow_png)).convert("RGB")
+
+    # Scale to minimum width for crispness
+    MIN_W = 3600
+    if g.width < MIN_W:
+        sc = MIN_W/g.width
+        g  = g.resize((int(g.width*sc), int(g.height*sc)), Image.LANCZOS)
+    gw, gh = g.size
+
+    # For post-compliance: add top padding and overlay controls
+    if state == "future" and privacy_controls and nodes and dot_obj:
+        # Add white space above and below for control boxes
+        padded = Image.new("RGB",(gw, gh+TOP_PAD+BOT_PAD),"#FFFFFF")
+        padded.paste(g, (0, TOP_PAD))
+        # Get positions in original image space then offset
+        raw_pos = _get_node_positions(dot_obj, gw, gh)
+        scaled_pos = {}
+        for k,v in raw_pos.items():
+            scaled_pos[k] = dict(
+                cx=v["cx"], cy=v["cy"]+TOP_PAD,
+                w=v["w"],   h=v["h"],
+                x1=v["x1"],  y1=v["y1"]+TOP_PAD,
+                x2=v["x2"],  y2=v["y2"]+TOP_PAD,
+            )
+        g = _overlay_privacy_controls(padded, scaled_pos, privacy_controls, nodes)
+        gw, gh = g.size
+
+    W = gw + PAD*2
+    H = HEADER_H + BANNER_H + gh + LEG_H + 18
     cv = Image.new("RGB",(W,H),"#FFFFFF")
     dr = ImageDraw.Draw(cv)
 
-    # Header
-    dr.rectangle([0,0,W,HEADER_H], fill=C["header_bg"])
-    dr.rectangle([14,12,106,HEADER_H-12], fill="#2470A0", outline="#154C80", width=2)
-    dr.text((20,18),"DATA\nFLOW\nANALYSIS", font=_f(10,True), fill="#FFFFFF")
-    dr.text((118,10), title, font=_f(28,True), fill="#FFFFFF")
-    dr.text((119,50),"Privacy & Data Protection Review  ·  DPDPA 2023 / GDPR",
+    # ── Header ────────────────────────────────────────────────────────────────
+    dr.rectangle([0,0,W,HEADER_H], fill="#1A3A5C")
+    dr.rectangle([14,12,108,HEADER_H-12], fill="#2470A0", outline="#154C80", width=2)
+    dr.text((21,18),"DATA\nFLOW\nANALYSIS", font=_f(10,True), fill="#FFFFFF")
+    dr.text((120,10), title, font=_f(28,True), fill="#FFFFFF")
+    dr.text((121,50),"Privacy & Data Protection Review  ·  DPDPA 2023 / GDPR",
             font=_f(13), fill="#93C6E7")
     bc="#C0392B" if state=="asis" else "#1A6B3A"
     bt="CURRENT STATE" if state=="asis" else "POST COMPLIANCE"
     dr.rounded_rectangle([W-295,16,W-14,HEADER_H-16], radius=6, fill=bc)
     dr.text((W-280,30), bt, font=_f(14,True), fill="#FFFFFF")
 
-    # Banner
+    # ── Banner ────────────────────────────────────────────────────────────────
     dr.rectangle([0,HEADER_H,W,HEADER_H+BANNER_H], fill=banner_color)
-    dr.text((40,HEADER_H+14),"◼  "+banner_txt, font=_f(17,True), fill="#FFFFFF")
+    dr.text((PAD,HEADER_H+14),"◼  "+banner_txt, font=_f(17,True), fill="#FFFFFF")
 
-    # Diagram
-    cv.paste(diagram_img, (40, HEADER_H+BANNER_H))
+    # ── Flow diagram ──────────────────────────────────────────────────────────
+    cv.paste(g, (PAD, HEADER_H+BANNER_H))
 
-    # Legend
-    ly = HEADER_H+BANNER_H+DH+5
-    dr.rectangle([0,ly,W,ly+LEG_H], fill=C["legend_bg"])
+    # ── Legend ────────────────────────────────────────────────────────────────
+    ly = HEADER_H+BANNER_H+gh+5
+    dr.rectangle([0,ly,W,ly+LEG_H], fill="#F4F6F8")
     dr.line([(0,ly),(W,ly)], fill="#CCCCCC", width=1)
     items=[
         ("#FFF5CC","#A07800","External Entity / Data Subject"),
@@ -397,62 +311,54 @@ def _make_page(diagram_img: Image.Image, title: str, state: str,
         ("#FFFFFF","#555555","Process Step"),
         ("#C0392B","#8B2222","Decision Gate / Endpoint"),
         ("#D4E8FA","#1A5276","Data Store / System"),
-        ("#D5E8D4","#27AE60","Privacy Control"),
+        ("#D5E8D4","#2E8B57","Privacy Control"),
     ]
-    lx=40
+    lx=PAD
     for fc,sc2,lb in items:
-        dr.rounded_rectangle([lx,ly+12,lx+18,ly+30],radius=3,fill=fc,outline=sc2,width=1)
-        dr.text((lx+24,ly+13),lb, font=_f(11), fill="#444444")
-        lx+=210
-    dr.text((40,ly+LEG_H-14),
-            "⚠  Red arrows = sensitive data (financial, health, biometric)  ·  Dashed = feedback / back-flow",
+        dr.rounded_rectangle([lx,ly+12,lx+20,ly+30],radius=3,fill=fc,outline=sc2,width=1)
+        dr.text((lx+26,ly+13),lb, font=_f(11), fill="#444444")
+        lx+=205
+    dr.text((PAD,ly+LEG_H-14),
+            "⚠  Red arrows = sensitive data flows (financial, health, biometric)  "
+            "·  Dashed grey = back-flow / result feedback",
             font=_f(9), fill="#C0392B")
     return cv
 
 
+# ── Public API ─────────────────────────────────────────────────────────────────
 def render_dfd(dfd_data: dict) -> tuple:
     title  = dfd_data.get("process_name","Data Flow Diagram")
     asis   = dfd_data.get("asis",  {"nodes":[],"edges":[]})
     future = dfd_data.get("future",{"nodes":[],"edges":[]})
     ctrls  = dfd_data.get("privacy_controls",{})
 
-    # Determine canvas height based on max nodes in any phase
-    def _max_nodes(data):
-        pm={}
-        for n in data.get("nodes",[]):
-            ph=n.get("phase","processing").lower()
-            pm[ph]=pm.get(ph,0)+1
-        return max(pm.values()) if pm else 3
-
-    def _chart_h(data, with_ctrls):
-        mn = _max_nodes(data)
-        base = max(900, mn*180 + 120)
-        if with_ctrls: base += 260   # extra space for control boxes
-        return base
-
-    asis_h   = _chart_h(asis, False)
-    future_h = _chart_h(future, True)
-
-    asis_diag   = _render_diagram(asis["nodes"],   asis["edges"],   {}, False, W_CANVAS-80, asis_h)
-    future_diag = _render_diagram(future["nodes"], future["edges"], ctrls, True, W_CANVAS-80, future_h)
-
-    asis_page   = _make_page(asis_diag,   title, "asis",
-                             "Current State  ·  Existing Data Flows (Without Privacy Controls)",
-                             C["banner_asis"])
-    future_page = _make_page(future_diag, title, "future",
-                             "Post Compliance  ·  Privacy-Embedded Future State",
-                             C["banner_future"])
-
     def _to_png(img):
         b=io.BytesIO(); img.save(b,format="PNG",dpi=(250,250)); return b.getvalue()
     def _to_pdf(img):
         b=io.BytesIO(); img.save(b,format="PDF",resolution=250); return b.getvalue()
 
-    return _to_png(asis_page),_to_pdf(asis_page),_to_png(future_page),_to_pdf(future_page)
+    # ── Current State ─────────────────────────────────────────────────────────
+    dot_a    = _build_dot(asis)
+    png_a    = dot_a.pipe(format="png")
+    asis_img = _compose_page(png_a, title, "asis",
+                             "Current State  ·  Existing Data Flows (Without Privacy Controls)",
+                             "#C0392B")
+
+    # ── Post Compliance ────────────────────────────────────────────────────────
+    dot_f   = _build_dot(future)
+    png_f   = dot_f.pipe(format="png")
+    fut_img = _compose_page(png_f, title, "future",
+                            "Post Compliance  ·  Privacy-Embedded Future State",
+                            "#1A6B3A",
+                            privacy_controls=ctrls,
+                            nodes=future.get("nodes",[]),
+                            dot_obj=dot_f)
+
+    return _to_png(asis_img),_to_pdf(asis_img),_to_png(fut_img),_to_pdf(fut_img)
 
 
 DFD_JSON_SCHEMA='''
-Return ONLY a valid JSON array with exactly ONE element. No markdown. No text before or after.
+Return ONLY a valid JSON array with exactly ONE element. No markdown. No text.
 
 [{"id":"P001","process_name":"Name ≤50 chars",
   "asis":{"nodes":[...],"edges":[...]},
@@ -463,14 +369,14 @@ Return ONLY a valid JSON array with exactly ONE element. No markdown. No text be
 NODE: {"id":"snake_id","label":"≤14 chars","type":"external|team|process|decision|endpoint|datastore","phase":"collection|processing|storage|sharing|exit"}
 EDGE: {"from":"id","to":"id","label":"≤12 chars"}
 
-PHASES (strict left-to-right):
-  collection = data SOURCES (portals, email, agencies, external entities)
-  processing = sequential STEPS left→right (team review, interview, BGV, decision gate)
-  storage    = STORAGE SYSTEMS (HRMS, Email System, database)
-  sharing    = EXTERNAL RECIPIENTS (vendors, banks, insurance, regulators)
-  exit       = FINAL STATES (Hired, Rejected, Archived, Offboarded)
+LAYOUT RULES (critical for clean output):
+  collection = parallel DATA SOURCES on the left (portals, email, agencies)
+  processing = SEQUENTIAL steps in a chain left→right (team → review → BGV → decision)
+  storage    = data STORES (HRMS, email system) — max 3 nodes
+  sharing    = external RECIPIENTS on the right (vendors, banks, insurance)
+  exit       = FINAL STATES (Hired, Rejected, Archived)
 
-CRITICAL: privacy_controls keys must EXACTLY match node IDs (snake_case).
-Controls: 3-4 per node, ≤20 chars. Min 10 nodes + 10 edges.
-future nodes = same IDs as asis. All edge IDs must exist.
+PRIVACY CONTROLS: keys MUST exactly match node IDs. 3-4 per node, ≤20 chars each.
+These appear as green boxes above/below each node.
+Min 10 nodes + 10 edges. future node IDs = same as asis.
 '''
